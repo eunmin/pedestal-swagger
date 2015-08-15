@@ -80,7 +80,7 @@
        :head non-documented-handler}]
      ["/doc" {:get [(swagger-json)]}]]]])
 
-(def app (make-app {::bootstrap/router :prefix-tree ;; or :linear-search
+(def app (make-app {::bootstrap/router :prefix-tree
                     ::bootstrap/routes (doc/inject-docs
                                         {:title "Test"
                                          :version "0.1"} routes)}))
@@ -95,6 +95,7 @@
                               :header {(req "auth") s/Str}}
                  :responses {200 {:schema {:status s/Str}}
                              400 {}
+                             422 {}
                              500 {}
                              :default {:schema {:result [s/Str]}
                                        :headers {(req "Location") s/Str}}}}}
@@ -106,7 +107,7 @@
                  :parameters {:path {:id s/Int}
                               :header {(req "auth") s/Str}
                               :body {:name s/Keyword}}
-                 :responses {400 {} 500 {}}}
+                 :responses {400 {} 500 {} 422 {}}}
                 :delete
                 {:consumes ["application/edn"]
                           :description "Requires id on path"
@@ -114,13 +115,13 @@
                           :parameters {:path {:id s/Int}
                                        :header {(req "auth") s/Str}
                                        :query {:notify s/Bool}}
-                        :responses {400 {}
-                                    500 {}}}}}]
+                 :responses {400 {} 500 {} 422 {}}}}}]
     (is (= paths (doc/gen-paths routes)))))
 
+(def validator (v/validator (slurp (io/resource "ring/swagger/v2.0_schema.json"))))
+
 (deftest generates-valid-json-schema
-  (let [validator (v/validator (slurp (io/resource "ring/swagger/v2.0_schema.json")))]
-    (validator (spec/swagger-json {:paths (doc/gen-paths routes)}))))
+  (validator (spec/swagger-json {:paths (doc/gen-paths routes)})))
 
 (deftest coerces-params
   (are [resp req] (= resp (read-string (:body req)))
@@ -146,17 +147,7 @@
        (response-for app :put "http://t/x/1"
                      :headers {"Auth" "y"
                                "Content-Type" "application/edn"}
-                     :body (pr-str {:name "foo"})))
-
-  (testing "returns 400 when given bad json"
-    (is (= {:status 400
-            :body "Body params cannot be deserialised"}
-           (select-keys
-            (response-for app :put "http://t/x/1"
-                          :headers {"Auth" "y"
-                                    "Content-Type" "application/edn"}
-                          :body "{\"foo\": }")
-            [:status :body])))))
+                     :body (pr-str {:name "foo"}))))
 
 (deftest validates-response
   (are [status resp req] (and (= status (:status req))
@@ -166,7 +157,7 @@
                      :get "http://t/?q=ok"
                      :headers {"Auth" "y"})
 
-       400 {:error {:query-params {:q "missing-required-key"}}}
+       422 {:error {:query-params {:q "missing-required-key"}}}
        (response-for app
                      :get "http://t/"
                      :headers {"Auth" "y"})
@@ -181,6 +172,14 @@
        (response-for app
                      :get "http://t/?q=fail"
                      :headers {"Auth" "y"})))
+
+(deftest returns-error-when-given-bad-body
+  (is (= 400
+         (:status (response-for app
+                                :put "http://t/x/1"
+                                :headers {"Auth" "y"
+                                          "Content-Type" "application/edn"}
+                                :body "{\"foo\" }")))))
 
 (deftest checks-swagger-handler-like-any-other-route
   (are [resp req] (= resp (read-string (:body req)))

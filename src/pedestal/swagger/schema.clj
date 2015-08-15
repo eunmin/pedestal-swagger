@@ -24,6 +24,13 @@
     :default
     (pr-str e)))
 
+(defn- throw-if-error [schema value result]
+  (if (u/error? result)
+    (throw (ex-info
+            (format "Value does not match schema: %s" (pr-str result))
+            {:schema schema :value value :error result}))
+    result))
+
 (defn- loosen [schema]
   (assoc schema s/Any s/Any))
 
@@ -54,22 +61,15 @@
     :query-params {}
     :headers      {}} r))
 
-(defn coerce-request [schema value coercions]
-  ((c/coercer (->request-schema schema) coercions)
-   (with-request-defaults value)))
-
 (defn make-coerce-request
-  "Builds a coerce-request fn used in a swagger interceptor. A custom coercer can be built out of a coercer, validator and explainer"
-  [& {:keys [coercions explainer coercer]
-      :or {coercions c/+string-coercions+
-           explainer explain
-           coercer coerce-request}}]
-  (fn [schema {:keys [request] :as context}]
-    (let [result (coercer schema request coercions)]
-      (if (u/error? result)
-        (assoc (terminate context) :response
-               {:status 400 :headers {} :body (explainer result)})
-        (assoc context :request result)))))
+  "Builds a coerce-request fn used in a swagger interceptor.
+  Custom coercions can be passed as a parameter."
+  ([] (make-coerce-request c/string-coercion-matcher))
+  ([coercions]
+   (fn [schema request]
+     (let [result ((c/coercer (->request-schema schema) coercions)
+                   (with-request-defaults request))]
+       (throw-if-error schema request result)))))
 
 (defn- ->response-schema [{:keys [headers schema]}]
   (loosen
@@ -85,19 +85,12 @@
     :body nil}
    r))
 
-(defn validate-response [schema value coercions]
-  ((c/coercer (->response-schema schema) coercions)
-   (with-response-defaults value)))
-
 (defn make-validate-response
-  "Builds a validate-response fn used in a swagger interceptor. A custom validator can be built out of coercions, validator and explainer"
-  [& {:keys [coercions explainer validator]
-      :or {coercions {}
-           explainer explain
-           validator validate-response}}]
-  (fn [schema {:keys [response] :as context}]
-    (let [result (validator schema response coercions)]
-      (if (u/error? result)
-        (assoc context :response
-               {:status 500 :headers {} :body (explainer result)})
-        (assoc context :response result)))))
+  "Builds a validate-response fn used in a swagger interceptor.
+  Custom coercions can be passed as a parameter."
+  ([] (make-validate-response {}))
+  ([coercions]
+   (fn [schema response] 
+     (let [result ((c/coercer (->response-schema schema) coercions)
+                   (with-response-defaults response))]
+       (throw-if-error schema response result)))))

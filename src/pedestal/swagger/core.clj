@@ -4,11 +4,13 @@
             [pedestal.swagger.body-params :as body-params]
             [schema.core :as s]
             [io.pedestal.http.route.definition :refer [expand-routes]]
+
             [io.pedestal.interceptor.helpers :as interceptor]
-            [io.pedestal.interceptor :as i]
+            [io.pedestal.interceptor :refer [interceptor]]
             [ring.util.response :refer [response resource-response redirect]]
             [ring.swagger.swagger2 :as spec]
-            [ring.util.http-status :as status]))
+            [ring.util.http-status :as status]
+            [ring.util.http-response :as resp]))
 
 (defn- default-json-converter [swagger-object]
   (spec/swagger-json
@@ -22,93 +24,118 @@
    the swagger-object and returns a ring response."
   ([] (swagger-json default-json-converter))
   ([f]
-   (interceptor/before
-    ::doc/swagger-json
-    (fn [{:keys [route] :as context}]
-      (assoc context :response
-             {:status 200 :body (f (-> route meta ::doc/swagger-object))})))))
+   (interceptor
+    {:name ::doc/swagger-json
+     :enter
+     (fn [{:keys [route] :as context}]
+       (assoc context :response
+              {:status 200 :body (f (-> route meta ::doc/swagger-object))}))})))
 
 (defn swagger-ui
   "Creates an interceptor that serves the swagger ui on a path of your
   choice. Note that the path MUST specify a splat argument named
   \"resource\" e.g. \"my-path/*resource\". Acceps additional options
-  used to construct the swagger-object url (such as :app-name
+  used to construct the swagger-json url (such as :app-name
   :your-app-name), using pedestal's 'url-for'."
   [& path-opts]
-  (interceptor/handler
-   ::doc/swagger-ui
-   (fn [{:keys [path-params path-info url-for]}]
-     (let [res (:resource path-params)]
-       (case res
-         "" (redirect (str path-info "index.html"))
-         "conf.js" (response (str "window.API_CONF = {url: \""
-                                  (apply url-for ::doc/swagger-json path-opts)
-                                  "\"};"))
-         (resource-response res {:root "swagger-ui/"}))))))
+  (interceptor
+   {:name ::doc/swagger-ui
+    :enter
+    (fn [{:keys [request] :as context}]
+      (let [{:keys [path-params path-info url-for]} request
+            res (:resource path-params)]
+        (->> (case res
+               "" (redirect (str path-info "index.html"))
+               "conf.js" (response (str "window.API_CONF = {url: \""
+                                    (apply url-for ::doc/swagger-json path-opts)
+                                    "\"};"))
+               (resource-response res {:root "swagger-ui/"}))
+             (assoc context :response))))}))
 
 (defn coerce-request
-  "Creates an interceptor that coerces the params for the selected
-  route, according to the route's swagger documentation. A coercion
-  function f that acceps the route params schema and a context and return a
-  context can be supplied. The default implementation terminates the
-  interceptor chain if any coercion error occurs and return a 400
-  response with an explanation for the failure. For more information
-  consult 'pedestal.swagger.schema/?bad-request'."
+  "Creates an interceptor that coerces the incoming request according to the
+  selected route swagger documentation. A coercion function f that acceps the
+  current request and the route schema and returns a request be supplied. This
+  interceptor also catches coercion exceptions and returns unprocessable-entity
+  response. You can customise this behaviour assoc'ing your own :error key
+  behaviour."
   ([] (coerce-request (schema/make-coerce-request)))
   ([f]
    (doc/annotate
-    {:responses {400 {}}}
-     (interceptor/before
-      (fn [{:keys [route] :as context}]
-        (if-let [schema (->> route doc/annotation :parameters)]
-          (f schema context)
-          context))))))
+    {:responses {status/unprocessable-entity {}}}
+    (interceptor
+     {:name ::coerce-request
+      :enter
+      (fn [{:keys [route request] :as context}]
+        (if-let [schema (-> route doc/annotation :parameters)]
+          (update context :request (partial f schema))
+          context))
+      :error
+      (fn [context error]
+        (def xyz [context error])
+        (if (= ::coerce-request (-> error ex-data :interceptor))
+          (let [result (-> error ex-data :exception ex-data :error)]
+            (assoc context :response
+                   (resp/unprocessable-entity (schema/explain result))))
+          (throw error)))}))))
+
 
 (defn validate-response
-  "Creates an interceptor that validates the response for the selected
-  route, according to the route's swagger documentation. A validation
-  function f that accepts the route response schema and a context and
-  return a context can be supplied. The default implementation will
-  substitute the current response with a 500 response and an error
-  explanation if a validation error occours. For more information
-  consult 'pedestal.swagger.schema/?internal-server-error'."
+  "Creates an interceptor that validates the outgoing response according to the
+  selected route swagger documentation. A validation function f that acceps the
+  current response and the route schema and returns a response be supplied. This
+  interceptor also catches coercion exceptions and returns internal-server-error
+  response. You can customise this behaviour assoc'ing your own :error key
+  behaviour."
   ([] (validate-response (schema/make-validate-response)))
   ([f]
    (doc/annotate
-    {:responses {500 {}}}
-     (interceptor/after
-      (fn [{:keys [response route] :as context}]
-        (if-let [schemas (->> route doc/annotation :responses)]
-          (if-let [schema (or (schemas (:status response))
-                              (schemas :default))]
-            (f schema context)
-            context)
-          context))))))
+    {:responses {status/internal-server-error {}}}
+    (interceptor
+     {:name ::validate-response
+      :leave
+      (fn [{:keys [route response] :as context}]
+        (let [extract-schema (fn [responses]
+                               (or (responses (:status response))
+                                   (responses :default)))]
+          (if-let [schema (-> route doc/annotation
+                              :responses extract-schema)]
+            (update context :response (partial f schema))
+            context)))
+      :error
+      (fn [context error]
+        (if (= ::validate-response (-> error ex-data :interceptor))
+          (let [result (-> error ex-data :exception ex-data :error)] 
+            (assoc context :response
+                   (resp/internal-server-error (schema/explain result))))
+          (throw error)))}))))
 
 ;;;; Pedestal aliases
 
 (defn body-params
   "An almost drop-in replacement for pedestal's body-params.
   Accepts a parser map with content-type strings as keys instead of regexes.
-  Ensures the body keys assoc'd into the request are the ones coerce-request expects
-  and keywordizes keys by default. Returns a 400 if body-params cannot be deserialised."
+  Ensures the body keys assoc'd into the request are the ones coerce-request
+  expects and keywordizes keys by default. Returns a 400 if body-params cannot
+  be deserialised. This interceptor also catches deserialization exceptions and
+  returns bad-request response. You can customise this behaviour assoc'ing your
+  own :error key behaviour."
   ([] (body-params body-params/default-parser-map))
   ([parser-map]
    (doc/annotate
     {:consumes (keys parser-map)
-     :responses {400 {}}}
-    (i/interceptor
+     :responses {status/bad-request {}}}
+    (interceptor
      {:name ::body-params
       :enter
       (fn [{:keys [request] :as context}]
         (assoc context :request (body-params/parse-content-type parser-map request)))
       :error
       (fn [context error]
-        (if (and (= ::body-params (:interceptor (ex-data error)))
-                 (nil? (:response context)))
-          (assoc context :response {:status 400
-                                    :headers {}
-                                    :body "Body params cannot be deserialised"})
+        (if (= ::body-params (-> error ex-data :interceptor))
+          (assoc context :response
+                 ;; TODO body-params/explain ?
+                 (resp/bad-request "Deserialisation error"))
           (throw error)))}))))
 
 (defmacro defhandler
